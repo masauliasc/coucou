@@ -1,0 +1,562 @@
+#!/usr/bin/env python3
+"""coucou-remote — show Claude Code sessions that run on THIS machine (a Linux
+server you reach over SSH) in the Coucou island on ANOTHER one (your PC).
+
+This is the server half of the SSH bridge. The PC half is coucou-bridge.py.
+See README.md for the whole picture.
+
+    coucou-remote hook [EVENT]    what Claude Code runs on every hook event
+                                  (hook JSON on stdin)
+    coucou-remote install         add the hooks to ~/.claude/settings.json
+    coucou-remote uninstall       remove them again (only ours)
+    coucou-remote status          what is set up, and the command to run on the PC
+    coucou-remote set-token       store the shared secret (read from stdin)
+
+Same rules as the Coucou app itself (CLAUDE.md):
+  * Never block Claude Code. Every step has a deadline, any failure is silence,
+    and the exit code is always 0.
+  * Never overwrite settings.json: dated backup, merge, show the diff, write only
+    after a yes. Uninstall removes our entries and nothing else.
+  * Nothing is allowed unless a human clicked Allow in Coucou: this script never
+    prints a decision of its own, it only hands back what coucou-hook printed.
+
+Python 3.8+, standard library only.
+"""
+
+import argparse
+import difflib
+import hashlib
+import json
+import os
+import re
+import shlex
+import shutil
+import socket
+import stat
+import struct
+import sys
+import time
+from datetime import datetime
+
+PROTOCOL = 1
+# Identifies our entries inside settings.json. Deliberately not a superstring
+# match for the app's own marker ("coucou-hook"), so the two never confuse each
+# other if both are ever present.
+MARKER = "coucou-remote"
+
+# Same events and timeouts the Coucou app writes (windows/src-tauri/src/hooks.rs).
+# PermissionRequest waits for a human, so it gets the decision budget + 10 s.
+HOOK_EVENTS = [
+    ("SessionStart", 10),
+    ("SessionEnd", 10),
+    ("UserPromptSubmit", 10),
+    ("PreToolUse", 10),
+    ("PostToolUse", 10),
+    ("PostToolUseFailure", 10),
+    ("PermissionRequest", 120),
+    ("Notification", 10),
+    ("Stop", 10),
+    ("StopFailure", 10),
+    ("SubagentStart", 10),
+    ("SubagentStop", 10),
+]
+
+# Pointless to ship over the network and can be enormous (a whole file read).
+# coucou-hook drops the same fields on the PC.
+DROPPED_FIELDS = ("tool_response", "tool_output", "transcript_path")
+
+CONNECT_TIMEOUT = 0.3        # a local socket: it answers at once or not at all
+ACK_TIMEOUT = 1.5            # the PC must say "got it" this fast, or it is not there
+FIRE_AND_FORGET_BUDGET = 2.0  # whole run, for an event nobody waits on
+DECISION_BUDGET = 114.0      # coucou-hook waits 110 s for a human; the agent cuts at 113
+BREAKER_SECONDS = 20         # after a silent PC, stop trying for this long
+MAX_REQUEST = 4 * 1024 * 1024
+
+DEFAULT_PORT = 47900
+EVENT_RE = re.compile(r"^[A-Za-z]{1,40}$")
+TOKEN_RE = re.compile(r"^[A-Za-z0-9_-]{16,128}$")
+
+
+# ── Paths ─────────────────────────────────────────────────────────────────────
+
+def state_dir():
+    """~/.coucou-remote: our copy of this script, the token, the tunnel's socket."""
+    return os.environ.get("COUCOU_REMOTE_DIR") or os.path.join(os.path.expanduser("~"), ".coucou-remote")
+
+
+def socket_path():
+    """Where sshd creates the Unix socket for `ssh -R <this>:127.0.0.1:<port>`."""
+    return os.path.join(state_dir(), "bridge.sock")
+
+
+def token_path():
+    return os.path.join(state_dir(), "token")
+
+
+def breaker_path():
+    return os.path.join(state_dir(), "down")
+
+
+def installed_script_path():
+    return os.path.join(state_dir(), "coucou-remote")
+
+
+def claude_settings_path():
+    base = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.join(os.path.expanduser("~"), ".claude")
+    return os.path.join(base, "settings.json")
+
+
+# ── The hook ──────────────────────────────────────────────────────────────────
+
+def is_private_dir(path):
+    """A real directory (not a symlink), ours, closed to group and others."""
+    try:
+        st = os.lstat(path)
+    except OSError:
+        return False
+    return stat.S_ISDIR(st.st_mode) and st.st_uid == os.getuid() and (st.st_mode & 0o077) == 0
+
+
+def peer_is_us(sock):
+    """True when the process serving the socket runs as us (SO_PEERCRED).
+
+    The socket is made by the sshd session of our own account; anything else on
+    that path gets nothing from us. Linux only — an answer we cannot get is "no".
+    """
+    try:
+        cred = sock.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i"))
+        _pid, uid, _gid = struct.unpack("3i", cred)
+        return uid == os.getuid()
+    except (AttributeError, OSError, struct.error):
+        return False
+
+
+def read_line(sock, buf, deadline):
+    """The next newline-terminated line from `sock`, as (line, why).
+
+    why is "ok", "eof" (the other end closed) or "timeout". `buf` is a bytearray
+    kept between calls, because one recv may bring two lines.
+    """
+    while True:
+        i = buf.find(b"\n")
+        if i >= 0:
+            line = bytes(buf[:i])
+            del buf[: i + 1]
+            return line, "ok"
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return None, "timeout"
+        sock.settimeout(remaining)
+        try:
+            chunk = sock.recv(65536)
+        except socket.timeout:
+            return None, "timeout"
+        except OSError:
+            return None, "eof"
+        if not chunk:
+            return None, "eof"
+        buf.extend(chunk)
+        if len(buf) > MAX_REQUEST:
+            return None, "eof"
+
+
+def breaker_open():
+    try:
+        return time.time() - os.path.getmtime(breaker_path()) < BREAKER_SECONDS
+    except OSError:
+        return False
+
+
+def trip_breaker():
+    try:
+        with open(breaker_path(), "w") as f:
+            f.write(str(int(time.time())))
+    except OSError:
+        pass
+
+
+def clear_breaker():
+    try:
+        os.unlink(breaker_path())
+    except OSError:
+        pass
+
+
+def load_token():
+    value = os.environ.get("COUCOU_REMOTE_TOKEN", "").strip()
+    if value:
+        return value
+    try:
+        with open(token_path()) as f:
+            return f.read().strip()
+    except OSError:
+        return ""
+
+
+def build_request(payload, event_arg, token, host):
+    """The one line sent to the PC, or None when there is nothing to send."""
+    payload = dict(payload)
+    for field in DROPPED_FIELDS:
+        payload.pop(field, None)
+    event = payload.get("hook_event_name") or event_arg or ""
+    if not isinstance(event, str) or not EVENT_RE.match(event):
+        event = ""
+    request = {"v": PROTOCOL, "token": token, "host": host, "event": event, "payload": payload}
+    data = json.dumps(request, separators=(",", ":")).encode("utf-8") + b"\n"
+    return (data, event) if len(data) <= MAX_REQUEST else None
+
+
+def talk(path, data, budget, started):
+    """Send `data` over the tunnel; the PC's reply (coucou-hook's stdout), or None."""
+    if not is_private_dir(os.path.dirname(path)):
+        return None
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        sock.settimeout(CONNECT_TIMEOUT)
+        try:
+            sock.connect(path)  # no tunnel up: nothing there, nothing to wait for
+        except OSError:
+            return None
+        if not peer_is_us(sock):
+            return None
+        sock.settimeout(ACK_TIMEOUT)
+        try:
+            sock.sendall(data)
+        except socket.timeout:
+            trip_breaker()
+            return None
+        except OSError:
+            return None
+
+        buf = bytearray()
+        # 1. "Got it" — fast, or the PC is asleep / the tunnel is half dead. A
+        #    long permission wait must not start on a connection nobody reads.
+        line, why = read_line(sock, buf, min(started + budget, time.monotonic() + ACK_TIMEOUT))
+        if line is None:
+            if why == "timeout":
+                trip_breaker()
+            return None
+        try:
+            if json.loads(line).get("ack") != 1:
+                return None
+        except (ValueError, AttributeError):
+            return None
+        clear_breaker()
+
+        # 2. The answer: coucou-hook's stdout. Empty means "no opinion".
+        line, _why = read_line(sock, buf, started + budget)
+        if line is None:
+            return None
+        try:
+            out = json.loads(line).get("stdout")
+        except (ValueError, AttributeError):
+            return None
+        return out if isinstance(out, str) and out.strip() else None
+    finally:
+        sock.close()
+
+
+def cmd_hook(args):
+    started = time.monotonic()
+    try:
+        raw = sys.stdin.buffer.read()
+        if raw.startswith(b"\xef\xbb\xbf"):
+            raw = raw[3:]
+        payload = json.loads(raw)
+        if not isinstance(payload, dict):
+            return 0
+        if breaker_open():
+            return 0
+        built = build_request(payload, args.event, load_token(), socket.gethostname())
+        if built is None:
+            return 0
+        data, event = built
+        budget = DECISION_BUDGET if event == "PermissionRequest" else FIRE_AND_FORGET_BUDGET
+        reply = talk(socket_path(), data, budget, started)
+        if reply:
+            sys.stdout.write(reply.strip() + "\n")
+            sys.stdout.flush()
+    except Exception:  # noqa: BLE001 — whatever goes wrong, Claude Code carries on
+        pass
+    return 0
+
+
+# ── settings.json ─────────────────────────────────────────────────────────────
+
+class SettingsError(Exception):
+    pass
+
+
+def hook_command(script, event):
+    return "{} hook {}".format(shlex.quote(script), event)
+
+
+def entry_is_ours(entry):
+    hooks = entry.get("hooks") if isinstance(entry, dict) else None
+    if not isinstance(hooks, list):
+        return False
+    return any(isinstance(h, dict) and MARKER in str(h.get("command", "")) for h in hooks)
+
+
+def merged(existing, script):
+    """`existing` with our hooks added; everything else untouched. A `hooks` (or
+    an event) that is not what Claude Code documents is refused, not replaced."""
+    root = dict(existing)
+    hooks = root.get("hooks")
+    if hooks is None:
+        hooks = {}
+    elif not isinstance(hooks, dict):
+        raise SettingsError('"hooks" has an unexpected type — not touching it.')
+    hooks = dict(hooks)
+    for event, timeout in HOOK_EVENTS:
+        current = hooks.get(event)
+        if current is None:
+            current = []
+        elif not isinstance(current, list):
+            raise SettingsError('"hooks"."{}" has an unexpected type — not touching it.'.format(event))
+        current = [e for e in current if not entry_is_ours(e)]
+        current.append({"hooks": [{"type": "command", "command": hook_command(script, event), "timeout": timeout}]})
+        hooks[event] = current
+    root["hooks"] = hooks
+    return root
+
+
+def without_ours(existing):
+    root = dict(existing)
+    hooks = root.get("hooks")
+    if hooks is None:
+        return root
+    if not isinstance(hooks, dict):
+        raise SettingsError('"hooks" has an unexpected type — not touching it.')
+    kept = {}
+    for event, value in hooks.items():
+        if isinstance(value, list):
+            left = [e for e in value if not entry_is_ours(e)]
+            if left:
+                kept[event] = left
+        else:
+            kept[event] = value
+    if kept:
+        root["hooks"] = kept
+    else:
+        root.pop("hooks")
+    return root
+
+
+def dump(settings):
+    return json.dumps(settings, indent=2, ensure_ascii=False) + "\n"
+
+
+def read_settings(path):
+    """(parsed, raw bytes). A missing file is an empty settings object."""
+    try:
+        with open(path, "rb") as f:
+            raw = f.read()
+    except FileNotFoundError:
+        return {}, None
+    if not raw.strip():
+        return {}, raw
+    try:
+        parsed = json.loads(raw)
+    except ValueError as err:
+        raise SettingsError("{} is not valid JSON ({}). Fix it first; nothing was changed.".format(path, err))
+    if not isinstance(parsed, dict):
+        raise SettingsError("{} is not a JSON object. Nothing was changed.".format(path))
+    return parsed, raw
+
+
+def unified(path, before, after):
+    return "".join(
+        difflib.unified_diff(
+            before.splitlines(True), after.splitlines(True), fromfile=path + " (now)", tofile=path + " (after)"
+        )
+    )
+
+
+def confirm(question, assume_yes):
+    if assume_yes:
+        return True
+    if not sys.stdin.isatty():
+        print("Not a terminal: re-run with --yes to apply.", file=sys.stderr)
+        return False
+    return input(question + " [y/N] ").strip().lower() in ("y", "yes")
+
+
+def write_settings(path, raw_before, new_text):
+    """Dated backup, then an atomic replace. Refuses if the file changed since it was read."""
+    backup = ""
+    if raw_before is not None:
+        with open(path, "rb") as f:
+            if hashlib.sha256(f.read()).digest() != hashlib.sha256(raw_before).digest():
+                raise SettingsError("{} changed while you were reading the diff. Run the command again.".format(path))
+        backup = "{}.bak-coucou-remote-{}".format(path, datetime.now().strftime("%Y%m%d-%H%M%S"))
+        shutil.copy2(path, backup)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = "{}.coucou-remote-{}".format(path, os.getpid())
+    with open(tmp, "w") as f:
+        f.write(new_text)
+        f.flush()
+        os.fsync(f.fileno())
+    if raw_before is not None:
+        shutil.copymode(path, tmp)
+    os.replace(tmp, path)
+    return backup
+
+
+def ensure_state_dir():
+    d = state_dir()
+    os.makedirs(d, exist_ok=True)
+    os.chmod(d, 0o700)
+    return d
+
+
+def install_script_copy():
+    """A stable copy of this script, so settings.json never points into a checkout
+    that moves. Returns its path."""
+    ensure_state_dir()
+    dest = installed_script_path()
+    if os.path.abspath(__file__) != os.path.abspath(dest):
+        shutil.copyfile(__file__, dest)
+    os.chmod(dest, 0o755)
+    return dest
+
+
+def cmd_install(args):
+    path = claude_settings_path()
+    script = installed_script_path()
+    try:
+        current, raw = read_settings(path)
+        updated = merged(current, script)
+    except SettingsError as err:
+        print(str(err), file=sys.stderr)
+        return 1
+    before, after = dump(current), dump(updated)
+    if current == updated:
+        print("Hooks already installed in {}.".format(path))
+    else:
+        print(unified(path, before, after))
+        print("A dated backup of {} is taken first.".format(path) if raw is not None else "{} does not exist yet; it will be created.".format(path))
+        if not confirm("Write these changes?", args.yes):
+            print("Nothing was changed.")
+            return 1
+    install_script_copy()
+    if current != updated:
+        try:
+            backup = write_settings(path, raw, after)
+        except SettingsError as err:
+            print(str(err), file=sys.stderr)
+            return 1
+        if backup:
+            print("Backup: " + backup)
+    print("Hooks installed. Claude Code reads settings.json when a session starts: restart running sessions.")
+    print_next_steps()
+    return 0
+
+
+def cmd_uninstall(args):
+    path = claude_settings_path()
+    try:
+        current, raw = read_settings(path)
+        updated = without_ours(current)
+    except SettingsError as err:
+        print(str(err), file=sys.stderr)
+        return 1
+    if current == updated:
+        print("No coucou-remote hooks in {}.".format(path))
+        return 0
+    print(unified(path, dump(current), dump(updated)))
+    if not confirm("Write these changes?", args.yes):
+        print("Nothing was changed.")
+        return 1
+    try:
+        backup = write_settings(path, raw, dump(updated))
+    except SettingsError as err:
+        print(str(err), file=sys.stderr)
+        return 1
+    print("Backup: " + backup)
+    print("Hooks removed. {} (script, token) is left in place; delete it if you are done.".format(state_dir()))
+    return 0
+
+
+def hooks_installed(settings):
+    hooks = settings.get("hooks")
+    if not isinstance(hooks, dict):
+        return 0
+    return sum(
+        1 for _ev, lst in hooks.items() if isinstance(lst, list) and any(entry_is_ours(e) for e in lst)
+    )
+
+
+def print_next_steps():
+    print("")
+    print("On the PC (where Coucou runs):")
+    print("  python coucou-bridge.py --ssh <user>@<this-server> --remote-socket {}".format(socket_path()))
+    if not load_token():
+        print("It creates a shared secret on its first run and prints the one line to run here:")
+        print("  echo <secret> | {} set-token".format(installed_script_path()))
+
+
+def cmd_status(_args):
+    path = claude_settings_path()
+    try:
+        current, _raw = read_settings(path)
+        n = hooks_installed(current)
+    except SettingsError as err:
+        print(str(err), file=sys.stderr)
+        n = 0
+    print("settings.json : {} ({}/{} events hooked)".format(path, n, len(HOOK_EVENTS)))
+    print("script copy   : {} ({})".format(installed_script_path(), "ok" if os.path.exists(installed_script_path()) else "missing — run install"))
+    print("token         : {}".format("set" if load_token() else "NOT set — run set-token"))
+    sock = socket_path()
+    if os.path.exists(sock):
+        print("tunnel socket : {} (present — the PC's tunnel is up, or a stale file is left)".format(sock))
+    else:
+        print("tunnel socket : {} (absent — the PC's tunnel is not up)".format(sock))
+    print("silenced      : {}".format("yes, for up to {} s (the PC did not answer)".format(BREAKER_SECONDS) if breaker_open() else "no"))
+    print_next_steps()
+    return 0
+
+
+def cmd_set_token(_args):
+    token = sys.stdin.read().strip()
+    if not TOKEN_RE.match(token):
+        print("That does not look like the secret (16–128 characters of A–Z a–z 0–9 _ -).", file=sys.stderr)
+        return 1
+    ensure_state_dir()
+    fd = os.open(token_path(), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        f.write(token + "\n")
+    os.chmod(token_path(), 0o600)
+    print("Secret stored in {}.".format(token_path()))
+    return 0
+
+
+def main(argv=None):
+    argv = sys.argv[1:] if argv is None else argv
+    if argv and argv[0] == "hook":
+        # No argparse on this path: it exits with code 2 on anything odd, and a
+        # hook that exits 2 can block a tool call in Claude Code. Never that.
+        return cmd_hook(argparse.Namespace(event=argv[1] if len(argv) > 1 else ""))
+
+    ap = argparse.ArgumentParser(prog="coucou-remote", description=__doc__.split("\n\n")[0])
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    p = sub.add_parser("hook", help="run by Claude Code on every hook event (JSON on stdin)")
+    p.add_argument("event", nargs="?", default="")
+    for name in ("install", "uninstall"):
+        p = sub.add_parser(name)
+        p.add_argument("--yes", action="store_true", help="apply without asking")
+    sub.add_parser("status")
+    sub.add_parser("set-token")
+    args, _unknown = ap.parse_known_args(argv)  # a hook must never fail on an extra argument
+    handler = {
+        "hook": cmd_hook,
+        "install": cmd_install,
+        "uninstall": cmd_uninstall,
+        "status": cmd_status,
+        "set-token": cmd_set_token,
+    }[args.cmd]
+    return handler(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
