@@ -31,6 +31,7 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest import mock
 
 HERE = pathlib.Path(__file__).resolve().parent
 ROOT = HERE.parent
@@ -796,6 +797,85 @@ class InstallTests(TempDirCase):
         done = self.run_cli("status")
         self.assertEqual(done.returncode, 0)
         self.assertIn(b"--remote-socket", done.stdout)
+        self.assertIn(b"ABSENT", done.stdout)
+
+
+# ── Telling the tunnel's states apart (what `status` says) ────────────────────
+
+class TunnelProbeTests(TempDirCase):
+    """The hook is silent on every one of these; `status` is where they get names."""
+
+    def setUp(self):
+        super().setUp()
+        self.path = os.path.join(self.tmp, "bridge.sock")
+
+    def listen(self, hang_up):
+        srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        srv.bind(self.path)
+        srv.listen(4)
+        self.addCleanup(srv.close)
+
+        def serve():
+            try:
+                conn, _ = srv.accept()
+            except OSError:
+                return
+            if not hang_up:
+                time.sleep(1.0)  # an agent waiting for a request line
+            conn.close()
+
+        threading.Thread(target=serve, daemon=True).start()
+
+    def test_no_file_means_no_tunnel(self):
+        self.assertEqual(remote.probe_tunnel(self.path)[0], "absent")
+
+    def test_a_left_over_socket_file_is_stale(self):
+        srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        srv.bind(self.path)
+        srv.close()  # the file stays, nobody listens
+        self.assertTrue(os.path.exists(self.path))
+        self.assertEqual(remote.probe_tunnel(self.path)[0], "stale")
+
+    def test_a_listening_agent_is_live(self):
+        self.listen(hang_up=False)
+        self.assertEqual(remote.probe_tunnel(self.path)[0], "live")
+
+    def test_a_tunnel_whose_pc_end_hangs_up_is_a_dead_end(self):
+        self.listen(hang_up=True)
+        state, meaning = remote.probe_tunnel(self.path)
+        self.assertEqual(state, "dead-end")
+        self.assertIn("coucou-bridge.py", meaning)
+
+    def test_something_that_is_not_a_socket_is_an_error(self):
+        with open(self.path, "w") as f:
+            f.write("x")
+        self.assertEqual(remote.probe_tunnel(self.path)[0], "error")
+
+    def test_a_socket_we_may_not_connect_to_is_foreign_and_the_text_names_tailscale(self):
+        # What Tailscale SSH leaves: a socket made by root, mode 0600, in our directory.
+        srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        srv.bind(self.path)
+        srv.close()
+        with mock.patch.object(socket.socket, "connect", side_effect=PermissionError(13, "Permission denied")):
+            state, meaning = remote.probe_tunnel(self.path)
+        self.assertEqual(state, "foreign")
+        self.assertIn("Tailscale SSH", meaning)
+        self.assertIn("not by you", meaning)
+
+    def test_a_socket_served_by_another_account_is_foreign(self):
+        self.listen(hang_up=False)
+        with mock.patch.object(remote, "peer_is_us", return_value=False):
+            self.assertEqual(remote.probe_tunnel(self.path)[0], "foreign")
+
+    def test_the_hook_stays_silent_and_exits_zero_on_a_dead_socket_file(self):
+        srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        srv.bind(self.path)
+        srv.close()
+        os.chmod(self.tmp, 0o700)
+        env = dict(os.environ, COUCOU_REMOTE_DIR=self.tmp, COUCOU_REMOTE_TOKEN=TOKEN)
+        done = subprocess.run([sys.executable, str(REMOTE_SCRIPT), "hook", "Stop"],
+                              input=b'{"hook_event_name":"Stop"}', capture_output=True, env=env, timeout=20)
+        self.assertEqual((done.returncode, done.stdout, done.stderr), (0, b"", b""))
 
 
 if __name__ == "__main__":

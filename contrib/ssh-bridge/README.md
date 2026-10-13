@@ -78,6 +78,27 @@ the hook prints nothing and Claude Code asks for permission in the terminal as u
   1.5 s, then the server stays quiet for 20 s instead of paying that on every event;
 - a permission request is only held for a human once the PC has said "got it".
 
+## Nothing shows up? Ask `status`
+
+`~/.coucou-remote/coucou-remote status` connects to the tunnel socket (and sends nothing) and
+names what it finds. Claude Code is never told about any of these, which is the point, so this
+is where to look:
+
+| `tunnel` says | Meaning |
+| --- | --- |
+| `LIVE` | The tunnel is up and the PC's agent is listening. |
+| `ABSENT` | No tunnel: `coucou-bridge.py` is not running on the PC, or ssh is not connected. |
+| `STALE` | A left-over socket file, nothing behind it. Restart the tunnel on the PC. |
+| `DEAD-END` | The tunnel is up but nothing answers on the PC end (agent stopped, wrong `--port`). |
+| `FOREIGN` | The socket belongs to another account. See below. |
+
+**Tailscale SSH.** If you connect to the server through its Tailscale address and the server runs
+Tailscale SSH (`tailscale debug prefs | grep RunSSH` says `true`), `tailscaled` answers port 22 itself and
+creates the forwarded socket **as root, mode 0600**: your account cannot use it, and `coucou-remote`
+refuses it on purpose (`status` says `FOREIGN`). Tunnel through the normal OpenSSH server instead:
+the server's LAN address (`--ssh me@192.168.x.x`), or a second port for `sshd` reachable over
+Tailscale. Then `rm -f ~/.coucou-remote/bridge.sock` on the server once, and start the tunnel again.
+
 ## Security
 
 - The agent listens on `127.0.0.1` only, and refuses any request without the shared secret
@@ -99,6 +120,7 @@ the hook prints nothing and Claude Code asks for permission in the terminal as u
   without one).
 - **No plan-usage gauge** (that is `coucou-hook --statusline` and stays local).
 - **Linux servers.** The server half relies on `SO_PEERCRED`.
+- **Tailscale SSH as the tunnel.** Its forwarded sockets are root-owned (see above); use OpenSSH.
 - **"Open terminal"** from the island will find the window running `coucou-bridge.py`, not
   your SSH session: the app only sees the process that called the relay.
 - **One server per `coucou-bridge.py`.** For a second server, run a second instance with

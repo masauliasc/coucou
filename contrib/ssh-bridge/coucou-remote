@@ -496,6 +496,66 @@ def print_next_steps():
         print("  echo <secret> | {} set-token".format(installed_script_path()))
 
 
+def owner_name(uid):
+    try:
+        import pwd
+
+        return pwd.getpwuid(uid).pw_name
+    except (ImportError, KeyError):
+        return "uid {}".format(uid)
+
+
+def probe_tunnel(path):
+    """What is behind the tunnel socket, as (state, what it means).
+
+    Connects and hangs up without sending a byte, so the PC sees an empty
+    connection and ignores it. The hook itself stays silent on every one of
+    these; this is where they are told apart.
+
+    States: absent, stale, foreign, live, dead-end, error.
+    """
+    try:
+        st = os.lstat(path)
+    except FileNotFoundError:
+        return "absent", "the PC's tunnel is not up"
+    except OSError as err:
+        return "error", str(err)
+    if not stat.S_ISSOCK(st.st_mode):
+        return "error", "not a socket — remove it and restart the tunnel on the PC"
+
+    foreign = (
+        "owned by {owner}, not by you: the SSH server that made it ran as another account, so the hook "
+        "cannot (and, by design, will not) use it. This is what Tailscale SSH does — it answers port 22 on the "
+        "Tailscale address itself, as root. Point --ssh at the normal OpenSSH server instead (the LAN address, "
+        "or a second sshd port). Then: rm -f {path} and restart the tunnel on the PC."
+    )
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        sock.settimeout(0.5)
+        try:
+            sock.connect(path)
+        except ConnectionRefusedError:
+            return "stale", "a left-over file, nothing listens on it: the PC's tunnel is not up"
+        except PermissionError:
+            return "foreign", foreign.format(owner=owner_name(st.st_uid), path=path)
+        except OSError as err:
+            return "error", str(err)
+        if not peer_is_us(sock):
+            return "foreign", "served by another account than yours: the hook refuses it on purpose"
+        # Up to here sshd accepted. If the PC end has nobody to talk to, sshd hangs up.
+        sock.settimeout(0.4)
+        try:
+            if sock.recv(1) == b"":
+                return "dead-end", "the tunnel is up but nothing answers on the PC: is coucou-bridge.py running?"
+        except socket.timeout:
+            pass  # silence is what a listening agent does
+        except OSError:
+            return "dead-end", "the tunnel is up but the PC end is not answering"
+        return "live", "the tunnel is up and the PC's agent is listening"
+    finally:
+        sock.close()
+
+
 def cmd_status(_args):
     path = claude_settings_path()
     try:
@@ -508,10 +568,9 @@ def cmd_status(_args):
     print("script copy   : {} ({})".format(installed_script_path(), "ok" if os.path.exists(installed_script_path()) else "missing — run install"))
     print("token         : {}".format("set" if load_token() else "NOT set — run set-token"))
     sock = socket_path()
-    if os.path.exists(sock):
-        print("tunnel socket : {} (present — the PC's tunnel is up, or a stale file is left)".format(sock))
-    else:
-        print("tunnel socket : {} (absent — the PC's tunnel is not up)".format(sock))
+    state, meaning = probe_tunnel(sock)
+    print("tunnel socket : {}".format(sock))
+    print("tunnel        : {} — {}".format(state.upper(), meaning))
     print("silenced      : {}".format("yes, for up to {} s (the PC did not answer)".format(BREAKER_SECONDS) if breaker_open() else "no"))
     print_next_steps()
     return 0
